@@ -1,79 +1,151 @@
+from keras.layers import SimpleRNN, LSTM, GRU, Embedding, Dense, Flatten, Bidirectional
+from keras.models import Sequential
+from keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from keras.models import load_model
+from nltk.corpus import stopwords
 import pandas as pd
 import numpy as np
 import string
-from tensorflow.keras.preprocessing.text import Tokenizer
-from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.layers import Embedding, LSTM, Dense
-from tensorflow.keras.models import Sequential
-from nltk.corpus import stopwords
+import demoji
+import re
 from nltk.tokenize import word_tokenize
-from gensim.models import Word2Vec
-from sklearn.model_selection import train_test_split
+import os
+import json
 
 
-# Hiperparâmetros
-max_words = 10000
-max_sequence_length = 100
-embedding_dim = 100  # Dimensão das incorporações do Word2Vec
+max_vocab = 15000
+max_len = 500
 
 
-# Load the data
-data = pd.read_csv('Twitter_Data.csv')
-X_train, X_test, y_train, y_test = train_test_split(data['clean_text'], data['category'], test_size=0.2, random_state=42)
-
-# Preprocess the text data
-stop_words = set(stopwords.words('english'))
-def preprocess(text):
-    text = str(text).lower()
-    text = ''.join([word for word in text if word not in string.punctuation])
+def process_message(msg):
+    # Preprocess the text data
+    special_chars = string.punctuation
+    stop_words = set(stopwords.words('english'))
+    
+    text = str(msg).lower()
+    text = demoji.replace(text, '')
+    text = re.sub(f"[{special_chars}]", "", text)
     tokens = word_tokenize(text)
     tokens = [word for word in tokens if word not in stop_words]
+    
     return ' '.join(tokens)
 
-X_train = X_train.apply(preprocess)
-X_test = X_test.apply(preprocess)
+def preprocess_data(data_file):
+    if os.path.exists('sequences.json') and os.path.exists('labels.json') and os.path.exists('word_index.json'):
+        # Se os arquivos JSON já existirem, carregue-os
+        with open('sequences.json', 'r') as sequences_file, open('labels.json', 'r') as labels_file, open('word_index.json', 'r') as word_index_file:
+            sequences = json.load(sequences_file)
+            labels = json.load(labels_file)
+            word_index = json.load(word_index_file)
+    else:
+        data = pd.read_csv(data_file)
+        print('Pre-processamento')
+        messages = []
+        labels = []
 
-# Tokenize the text data
-tokenizer = Tokenizer()
-tokenizer.fit_on_texts(X_train)
+        for index, row in data.iterrows():
+            processed_message = process_message(row['clean_text'])  # Processa a mensagem
+            messages.append(processed_message)
+            if row['category'] == -1:
+                labels.append(0)
+            elif row['category'] == 0:
+                labels.append(1)
+            else:
+                labels.append(2)
 
-X_train = tokenizer.texts_to_sequences(X_train)
-X_test = tokenizer.texts_to_sequences(X_test)
+        messages = np.asarray(messages)
+        labels = np.asarray(labels)
 
-vocab_size = len(tokenizer.word_index) + 1
+        tokenizer = Tokenizer(num_words=max_vocab)
+        tokenizer.fit_on_texts(messages)
+        sequences = tokenizer.texts_to_sequences(messages)
 
-# Pad the sequences to a fixed length
-max_length = 100
-X_train = pad_sequences(X_train, maxlen=max_length, padding='post')
-X_test = pad_sequences(X_test, maxlen=max_length, padding='post')
+        word_index = tokenizer.word_index
+        word_index['<UNK>'] = len(word_index) + 1
 
-# Train the Word2Vec model
-sentences = [sentence for sentence in X_train]
-w2v_model = Word2Vec(sentences, size=100, window=5, min_count=5, workers=4)
+        # Salvar os objetos em arquivos JSON
+        with open('sequences.json', 'w') as sequences_file, open('labels.json', 'w') as labels_file, open('word_index.json', 'w') as word_index_file:
+            json.dump(sequences, sequences_file)
+            json.dump(labels, labels_file)
+            json.dump(word_index, word_index_file)
 
-# Create a weight matrix for the embedding layer
-embedding_matrix = np.zeros((vocab_size, 100))
-for word, i in tokenizer.word_index.items():
-    if word in w2v_model.wv:
-        embedding_matrix[i] = w2v_model.wv[word]
+    return sequences, labels, word_index, max_len
+
+def main(rnn_model, data_file):
+    sequences, labels, word_index, max_len = preprocess_data(data_file)
+    print("Number of messages: ", len(sequences))
+    print("Number of labels: ", len(labels))
+
+    data = pad_sequences(sequences, maxlen=max_len)
+    print("data shape: ", data.shape)
+
+    train_samples = int(len(sequences) * 0.8)
+    messages_train = data[:train_samples]
+    labels_train = labels[:train_samples]
+    messages_test = data[train_samples:len(sequences) - 2]
+    labels_test = labels[train_samples:len(sequences) - 2]
+
+    embedding_mat_columns = 32
+    model = Sequential()
+    model.add(Embedding(input_dim=len(word_index), output_dim=embedding_mat_columns, input_length=max_len))
+    #if rnn_model == 'SimpleRNN':
+    #model.add(SimpleRNN(units=embedding_mat_columns))
+    model.add(Bidirectional(LSTM(128, dropout=0.2, recurrent_dropout=0.2)))
+    model.add(Dense(1, activation='softmax'))
+    #model.add(Dense(1, activation='sigmoid'))
+    #elif rnn_model == 'LSTM':
+     #   model.add(LSTM(units=embedding_mat_columns))
+    #else:
+     #   model.add(GRU(units=embedding_mat_columns))
+    #model.add(Dense(1, activation='sigmoid'))
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    model.summary()
+
+    model.save(rnn_model + '.keras')
+    model.fit(messages_train, labels_train, epochs=12, batch_size=60, validation_split=0.2)
+    acc = model.evaluate(messages_test, labels_test)
+    print("Test loss is {0:.2f} accuracy is {1:.2f}".format(acc[0], acc[1]))
+
+def load_and_classify(model_path, custom_msg, word_index, max_len):
+    loaded_model = load_model(model_path)
+    def message_to_array(msg):
+        msg = msg.lower().split(' ')
+        print(msg)
+        test_seq = [word_index[word] if word in word_index and word_index[word] < max_vocab else word_index['<UNK>'] for word in msg]
+        test_seq = [idx if idx < max_vocab else max_vocab - 1 for idx in test_seq]
+
+        test_seq = np.pad(test_seq, (max_len - len(test_seq), 0), 'constant', constant_values=(0))
+        test_seq = test_seq.reshape(1, max_len)
+        return test_seq
+
+    test_seq = message_to_array(custom_msg)
+    pred = loaded_model.predict(test_seq)
+    class_names = ["negative", "neutral", "positive"]
+    print(pred)
+    pred = loaded_model.predict(test_seq)
 
 
-# Crie o modelo RNN com as incorporações do Word2Vec
-model = Sequential()
-model.add(Embedding(input_dim=max_words, output_dim=embedding_dim, input_length=max_sequence_length, weights=[embedding_matrix], trainable=False))
-model.add(LSTM(64))
-model.add(Dense(3, activation='softmax'))
+    # Defina o limiar de decisão
+    threshold = 0.3
 
-# Compile o modelo
-model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
+    # Obtenha o índice da classe com maior probabilidade
+    predicted_class_index = (pred > threshold).argmax()
 
-# Treine o modelo
-model.fit(X_train, y_train, epochs=10, validation_data=(X_test, y_test))
+    # Use o índice para obter a classe correspondente
+    predicted_class = class_names[predicted_class_index]
 
-# Avalie o modelo
-loss, accuracy = model.evaluate(X_test, y_test)
-print(f'Loss: {loss}')
-print(f'Accuracy: {accuracy}')
+    print(f"A classificação prevista é: {predicted_class}")
 
-# Faça previsões com o modelo
-predictions = model.predict(X_test)
+    #for i in range(len(class_names)):
+        #print(f"{class_names[i]}: {pred[0][i]:.2f}")
+
+if __name__ == '__main__':
+    data_file = "Twitter_Data.csv"
+    main('SimpleRNN', data_file)
+    print('Teste')
+    model_path = 'SimpleRNN.keras'  # Substitua pelo caminho correto para o arquivo .keras
+    custom_msg = 'but arrogant modi sarkar destroyed msmes for yrs with the worlds most complicated with rates 1000 modifications'  # Sua mensagem de exemplo
+    #_ , _, word_index, max_len = preprocess_data(data_file)
+    # Chame a função para carregar o modelo e fazer a classificação
+    #load_and_classify(model_path, custom_msg, word_index, max_len)
