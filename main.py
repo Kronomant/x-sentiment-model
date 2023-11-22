@@ -1,8 +1,9 @@
-from keras.layers import SimpleRNN, LSTM, GRU, Embedding, Dense, Flatten, Bidirectional
-from keras.models import Sequential
-from keras.preprocessing.text import Tokenizer
+from tensorflow.keras.layers import LSTM,  Embedding, Dense, Dropout, Bidirectional, Conv1D, MaxPooling1D
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.preprocessing.sequence import pad_sequences
-from keras.models import load_model
+from gensim.models import Word2Vec
+from sklearn.model_selection import train_test_split
 from nltk.corpus import stopwords
 import pandas as pd
 import numpy as np
@@ -12,100 +13,139 @@ import re
 from nltk.tokenize import word_tokenize
 import os
 import json
+from nltk.stem import PorterStemmer
 
-
+ps = PorterStemmer()
 max_vocab = 15000
-max_len = 500
+max_len = 144
+embedding_mat_columns = 64
+import pickle
+
 
 
 def process_message(msg):
     # Preprocess the text data
     special_chars = string.punctuation
+    
     stop_words = set(stopwords.words('english'))
     
     text = str(msg).lower()
     text = demoji.replace(text, '')
+    text = re.sub(r'\d+', '', text)
     text = re.sub(f"[{special_chars}]", "", text)
     tokens = word_tokenize(text)
     tokens = [word for word in tokens if word not in stop_words]
+    tokens = [ps.stem(word) for word in tokens]
     
     return ' '.join(tokens)
 
+def train_word2vec_model(messages, embedding_mat_columns):
+    word2vec_model = Word2Vec(sentences=messages, vector_size=embedding_mat_columns, window=5, min_count=10, sg=1, workers=8)
+    word2vec_model.save("word2vec.model")
+
 def preprocess_data(data_file):
-    if os.path.exists('sequences.json') and os.path.exists('labels.json') and os.path.exists('word_index.json'):
+
+    messages = []
+    labels = []
+    if os.path.exists('messages.json') and os.path.exists('labels.json'):
         # Se os arquivos JSON já existirem, carregue-os
-        with open('sequences.json', 'r') as sequences_file, open('labels.json', 'r') as labels_file, open('word_index.json', 'r') as word_index_file:
-            sequences = json.load(sequences_file)
+        with open('messages.json', 'r') as messages_file, open('labels.json', 'r') as labels_file:
+            messages = json.load(messages_file)
             labels = json.load(labels_file)
-            word_index = json.load(word_index_file)
+            
     else:
         data = pd.read_csv(data_file)
         print('Pre-processamento')
         messages = []
         labels = []
 
+
         for index, row in data.iterrows():
-            processed_message = process_message(row['clean_text'])  # Processa a mensagem
+            processed_message = process_message(row[4])  # Processa a mensagem
             messages.append(processed_message)
-            if row['category'] == -1:
+            if row[0] == 0:
                 labels.append(0)
-            elif row['category'] == 0:
+            elif row[0] == 2:
                 labels.append(1)
             else:
                 labels.append(2)
-
-        messages = np.asarray(messages)
-        labels = np.asarray(labels)
-
-        tokenizer = Tokenizer(num_words=max_vocab)
-        tokenizer.fit_on_texts(messages)
-        sequences = tokenizer.texts_to_sequences(messages)
-
-        word_index = tokenizer.word_index
-        word_index['<UNK>'] = len(word_index) + 1
-
-        # Salvar os objetos em arquivos JSON
-        with open('sequences.json', 'w') as sequences_file, open('labels.json', 'w') as labels_file, open('word_index.json', 'w') as word_index_file:
-            json.dump(sequences, sequences_file)
+    # Salvar os objetos em arquivos JSON
+        with open('messages.json', 'w') as messages_file, open('labels.json', 'w') as labels_file:
+            json.dump(messages, messages_file)
             json.dump(labels, labels_file)
-            json.dump(word_index, word_index_file)
 
-    return sequences, labels, word_index, max_len
+
+    messages = np.asarray(messages)
+    labels_array = np.asarray(labels)
+
+    tokenizer = Tokenizer(num_words=max_vocab)
+    tokenizer.fit_on_texts(messages)
+
+
+     # Save the tokenizer
+    # saving
+    with open('tokenizer.pickle', 'wb') as handle:
+        pickle.dump(tokenizer, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    sequences = tokenizer.texts_to_sequences(messages)
+
+    word_index = tokenizer.word_index
+    word_index['<UNK>'] = len(word_index) + 1
+
+    if os.path.exists('word2vec.model'):
+        # Carregue o modelo Word2Vec treinado
+        word2vec_model = Word2Vec.load("word2vec.model")
+    else: 
+         # Treine o modelo Word2Vec
+        train_word2vec_model(messages, embedding_mat_columns)
+        word2vec_model = Word2Vec.load("word2vec.model")
+   
+    # Crie uma matriz de incorporação para inicializar a camada de incorporação
+    embedding_matrix = np.zeros((len(word_index) + 1, embedding_mat_columns))
+
+    for word, i in word_index.items():
+        if word in word2vec_model.wv:
+            embedding_matrix[i] = word2vec_model.wv[word]
+
+    return sequences, labels_array, embedding_matrix, max_len
 
 def main(rnn_model, data_file):
-    sequences, labels, word_index, max_len = preprocess_data(data_file)
+    sequences, labels, embedding_matrix, max_len = preprocess_data(data_file)
+
     print("Number of messages: ", len(sequences))
     print("Number of labels: ", len(labels))
 
     data = pad_sequences(sequences, maxlen=max_len)
     print("data shape: ", data.shape)
 
-    train_samples = int(len(sequences) * 0.8)
-    messages_train = data[:train_samples]
-    labels_train = labels[:train_samples]
-    messages_test = data[train_samples:len(sequences) - 2]
-    labels_test = labels[train_samples:len(sequences) - 2]
-
-    embedding_mat_columns = 32
+    # Divisão dos dados em treinamento e ppteste
+    X_train, X_test, y_train, y_test = train_test_split(data, labels, test_size=0.2, random_state=42)
+    hidden_units = 128  # Número de unidades LSTM
     model = Sequential()
-    model.add(Embedding(input_dim=len(word_index), output_dim=embedding_mat_columns, input_length=max_len))
-    #if rnn_model == 'SimpleRNN':
-    #model.add(SimpleRNN(units=embedding_mat_columns))
-    model.add(Bidirectional(LSTM(128, dropout=0.2, recurrent_dropout=0.2)))
-    model.add(Dense(1, activation='softmax'))
-    #model.add(Dense(1, activation='sigmoid'))
-    #elif rnn_model == 'LSTM':
-     #   model.add(LSTM(units=embedding_mat_columns))
-    #else:
-     #   model.add(GRU(units=embedding_mat_columns))
-    #model.add(Dense(1, activation='sigmoid'))
+    model.add(Embedding(
+        input_dim=len(embedding_matrix),
+        output_dim=embedding_mat_columns,
+        weights=[embedding_matrix], 
+        input_length=max_len,
+        trainable=False
+    ))
+    model.add(LSTM(hidden_units))
+    model.add(Dropout(0.2))
+    model.add(LSTM(hidden_units))
+    model.add(Dropout(0.2))
+    model.add(Dense(3, activation='softmax'))
+
+    # Compilação do modelo
     model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
     model.summary()
 
+    # Treinamento do modelo
+    batch_size = 64
+    epochs = 1
+    model.fit(X_train, y_train, validation_data=(X_test, y_test), batch_size=batch_size, epochs=epochs)
+    model.summary()
+
     model.save(rnn_model + '.keras')
-    model.fit(messages_train, labels_train, epochs=12, batch_size=60, validation_split=0.2)
-    acc = model.evaluate(messages_test, labels_test)
-    print("Test loss is {0:.2f} accuracy is {1:.2f}".format(acc[0], acc[1]))
 
 def load_and_classify(model_path, custom_msg, word_index, max_len):
     loaded_model = load_model(model_path)
@@ -141,7 +181,7 @@ def load_and_classify(model_path, custom_msg, word_index, max_len):
         #print(f"{class_names[i]}: {pred[0][i]:.2f}")
 
 if __name__ == '__main__':
-    data_file = "Twitter_Data.csv"
+    data_file = "new_data.csv"
     main('SimpleRNN', data_file)
     print('Teste')
     model_path = 'SimpleRNN.keras'  # Substitua pelo caminho correto para o arquivo .keras
